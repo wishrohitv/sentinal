@@ -1,0 +1,1 @@
+Alembic migrations live here. Create a new migration with `alembic revision --autogenerate -m "description"` from the backend directory, then review the generated migration before applying it.
