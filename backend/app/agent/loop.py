@@ -3,10 +3,10 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-import httpx
 from app.config import settings
 from app.models import EvidenceRecord, Incident, Investigation
 from app.services.investigation import TOOL_FUNCTIONS, execute_tool
@@ -46,7 +46,7 @@ class AgentLoop:
         await self.session.commit()
         try:
             async with asyncio.timeout(settings.sentinel_investigation_timeout):
-                result = await (self._run_demo(incident) if provider == "demo" else self._run_nemotron(incident))
+                result = await (self._run_demo(incident) if provider == "demo" else self._run_openai_compatible(incident))
             result = await self._validate_diagnosis(result)
             incident = await self.session.get(Incident, self.incident_id)
             incident.root_cause = result
@@ -99,22 +99,24 @@ class AgentLoop:
                 "description": f"Collect verified evidence using {name}.", "parameters": schema.model_json_schema()}})
         return definitions
 
-    async def _run_nemotron(self, incident: Incident) -> dict[str, Any]:
+    async def _run_openai_compatible(self, incident: Incident) -> dict[str, Any]:
+        base_url = settings.nebius_base_url
+        api_key = settings.nebius_api_key
+        model = settings.nvidia_model_name
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": "You are Sentinel, a reliability engineer. Choose only the provided tools to collect evidence, then return a final JSON diagnosis. Do not invent observations or evidence IDs. Propose only registered actions. If evidence is insufficient, set root_cause and remediation to null and list missing_information. Final JSON fields: root_cause, explanation, supporting_evidence, contradicting_evidence, missing_information, confidence, remediation, parameters, expected_outcome."},
             {"role": "user", "content": json.dumps({"incident_id": incident.id, "service_id": incident.service_id,
                 "title": incident.title, "trigger": incident.trigger, "trigger_metrics": incident.trigger_metrics})}
         ]
         tool_calls = 0
-        timeout = httpx.Timeout(25.0, connect=5.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=25.0, max_retries=0) as client:
             while tool_calls <= self.max_calls:
-                response = await client.post(f"{settings.nebius_base_url.rstrip('/')}/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.nebius_api_key}"},
-                    json={"model": settings.nvidia_model_name, "messages": messages,
-                          "tools": self._tool_definitions(), "tool_choice": "auto", "temperature": 0.1})
-                response.raise_for_status()
-                message = response.json()["choices"][0]["message"]
+                response = await client.chat.completions.create(
+                    model=model, messages=messages, tools=self._tool_definitions(),
+                    tool_choice="auto", temperature=0.1)
+                if not response.choices:
+                    raise ValueError("Model returned no response choices")
+                message = response.choices[0].message.model_dump(exclude_none=True)
                 calls = message.get("tool_calls") or []
                 if not calls:
                     content = message.get("content")

@@ -54,7 +54,7 @@ NVIDIA_MODEL_NAME=the-model-id-enabled-in-your-token-factory-project
 AI_PROVIDER=demo
 ```
 
-The UI will enable the Nemotron provider selector when the key and model are present. Provider calls are backend-only and use bearer auth, bounded HTTP timeouts, a maximum tool-call count, and the investigation deadline. Tool names and Pydantic arguments are validated server-side; malformed, unknown, or cross-service calls are rejected and recorded. Model output can propose actions only. The backend policy and action registry own execution.
+The UI will enable the model provider selector when the configured key and model are present. Provider calls are backend-only through the OpenAI Python SDK, using `NEBIUS_BASE_URL` as the configurable OpenAI-compatible endpoint and `NEBIUS_API_KEY` / `NVIDIA_MODEL_NAME` for authentication and model selection. The same client works with compatible chat-completions endpoints when those existing settings are configured accordingly. Calls have bounded timeouts, a maximum tool-call count, and an investigation deadline. Tool names and Pydantic arguments are validated server-side; malformed, unknown, or cross-service calls are rejected and recorded. Model output can propose actions only. The backend policy and action registry own execution.
 
 ## Local development without Docker
 

@@ -5,7 +5,9 @@ services:
       POSTGRES_DB: sentinel
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
-
+    # For local pgAdmin, map port 19999 to the default PostgreSQL port 5432
+    ports:
+      - "19999:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -25,6 +27,7 @@ services:
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
       NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.tokenfactory.nebius.com/v1}
       NVIDIA_MODEL_NAME: ${NVIDIA_MODEL_NAME:-}
+
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
