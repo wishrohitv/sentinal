@@ -1,6 +1,9 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
+
+import httpx
 from collections.abc import AsyncIterator
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -9,17 +12,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_session, SessionLocal
 from app.models import Service, Incident, EvidenceRecord, RemediationProposal, RemediationExecution, LogRecord, MetricSample
+from app.telemetry.loki import LokiAdapter
+from app.telemetry.monitored_app import MonitoredAppAdapter
+from app.telemetry.prometheus import PrometheusAdapter
 from app.schemas import IncidentOut, ApprovalIn, RejectIn, ScenarioOut, InvestigateIn, WorkloadRequest
 from app.simulator.state import SERVICE_ID, inject_pool_exhaustion, inject_worker_failure, reset_simulator, current_metrics, generate_workload
 from app.detection.detector import detect_incident
 from app.agent.loop import AgentLoop
 from app.services.remediation import decide_approval, propose_remediation
-from app.services.timeline import get_events
+from app.services.timeline import add_event, get_events
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 selected_provider = settings.effective_provider
 ACTIVE_INCIDENT_STATUSES = {"active", "investigating", "investigated", "awaiting_approval", "remediating", "escalated"}
+
+
+def require_simulator_mode() -> None:
+    if settings.telemetry_provider != "simulator":
+        raise HTTPException(409, "This route belongs to the simulator; use the monitored application in real telemetry mode")
+
 
 async def run_investigation(incident_id: str, provider: str) -> None:
     # Background tasks own their session; they never retain a request-scoped session.
@@ -28,9 +40,17 @@ async def run_investigation(incident_id: str, provider: str) -> None:
             agent = AgentLoop(session, incident_id)
             diagnosis = await agent.run(provider)
             await propose_remediation(session, incident_id, diagnosis)
-        except Exception:
+        except Exception as exc:
             logger.exception("Background investigation failed for incident %s", incident_id)
             await session.rollback()
+            incident = await session.get(Incident, incident_id)
+            if incident and incident.status in {"active", "investigating", "investigated"}:
+                incident.status = "escalated"
+                await add_event(session, incident_id, "INCIDENT_ESCALATED", {
+                    "reason": "Investigation or remediation proposal failed",
+                    "error_type": type(exc).__name__,
+                })
+                await session.commit()
 
 @router.get("/health")
 async def health():
@@ -51,6 +71,19 @@ async def set_provider(request: InvestigateIn):
     selected_provider = provider
     return await get_provider()
 
+@router.get("/system/telemetry")
+async def telemetry_status():
+    if settings.telemetry_provider == "prometheus_loki":
+        prometheus, loki, service = await asyncio.gather(
+            PrometheusAdapter().health(), LokiAdapter().health(), MonitoredAppAdapter().health())
+        return {"provider": "prometheus_loki", "service_id": settings.monitored_service_id,
+                "service_name": "Monitored Orders API", "prometheus": prometheus, "loki": loki,
+                "service": service, "ai_provider": selected_provider}
+    return {"provider": "simulator", "service_id": SERVICE_ID, "service_name": "Sentinel Demo API",
+            "prometheus": {"available": None}, "loki": {"available": None},
+            "service": {"available": True, "ready": True, "source": "simulator"},
+            "ai_provider": selected_provider}
+
 @router.get("/services")
 async def list_services(session: AsyncSession = Depends(get_session)):
     services = list((await session.scalars(select(Service))).all())
@@ -58,13 +91,20 @@ async def list_services(session: AsyncSession = Depends(get_session)):
 
 @router.get("/services/{service_id}/health")
 async def service_health(service_id: str, session: AsyncSession = Depends(get_session)):
+    if settings.telemetry_provider == "prometheus_loki":
+        if service_id != settings.monitored_service_id:
+            raise HTTPException(404, "Service not found in the selected telemetry environment")
+        health, metrics = await asyncio.gather(MonitoredAppAdapter().health(), PrometheusAdapter().current_metrics())
+        return {"id": service_id, "name": "Monitored Orders API", "status": "healthy" if health.get("ready") else "unhealthy",
+                "health": health, "metrics": metrics, "source": "prometheus_loki"}
     service = await session.get(Service, service_id)
     if not service:
         raise HTTPException(404, "Service not found")
-    return {"id": service.id, "name": service.name, "status": service.status, "metrics": await current_metrics(session)}
+    return {"id": service.id, "name": service.name, "status": service.status, "metrics": await current_metrics(session), "source": "simulator"}
 
 @router.post("/services/{service_id}/request")
 async def simulated_request(service_id: str, session: AsyncSession = Depends(get_session)):
+    require_simulator_mode()
     from fastapi.responses import JSONResponse
     if service_id != SERVICE_ID or not await session.get(Service, service_id):
         raise HTTPException(404, "Service not found")
@@ -79,17 +119,32 @@ async def simulated_request(service_id: str, session: AsyncSession = Depends(get
     return {"status": "ok", "request_latency_ms": metrics["request_latency_ms"]}
 
 @router.get("/services/{service_id}/metrics")
-async def get_service_metrics(service_id: str, minutes: int = Query(60, ge=1, le=1440), session: AsyncSession = Depends(get_session)):
+async def get_service_metrics(service_id: str, minutes: int = Query(60, ge=1, le=1440),
+                              include_samples: bool = False, session: AsyncSession = Depends(get_session)):
+    if settings.telemetry_provider == "prometheus_loki":
+        if service_id != settings.monitored_service_id:
+            raise HTTPException(404, "Service not found in the selected telemetry environment")
+        current = await PrometheusAdapter().current_metrics()
+        samples = await PrometheusAdapter().metric_samples(minutes) if include_samples else None
+        return {"service_id": service_id, "source": "prometheus", "current": current,
+                "samples": samples["metrics"] if samples else {}, "window_minutes": minutes}
     if not await session.get(Service, service_id):
         raise HTTPException(404, "Service not found")
     rows = list((await session.scalars(select(MetricSample).where(MetricSample.service_id == service_id)
         .order_by(desc(MetricSample.timestamp), desc(MetricSample.id)).limit(1000))).all())
-    return {"service_id": service_id, "current": await current_metrics(session), "samples": [
+    return {"service_id": service_id, "source": "simulator", "current": await current_metrics(session), "samples": [
         {"id": r.id, "name": r.name, "value": r.value, "timestamp": r.timestamp.isoformat()} for r in reversed(rows)]}
 
 @router.get("/services/{service_id}/logs")
 async def get_service_logs(service_id: str, severity: str | None = None, text: str | None = None,
+                           minutes: int = Query(60, ge=1, le=1440), around: datetime | None = None,
                            limit: int = Query(100, ge=1, le=500), session: AsyncSession = Depends(get_session)):
+    if settings.telemetry_provider == "prometheus_loki":
+        if service_id != settings.monitored_service_id:
+            raise HTTPException(404, "Service not found in the selected telemetry environment")
+        result = await LokiAdapter().query_logs(severity=severity, text=text, limit=limit,
+                                                minutes=minutes, around=around)
+        return {"service_id": service_id, **result}
     if not await session.get(Service, service_id):
         raise HTTPException(404, "Service not found")
     query = select(LogRecord).where(LogRecord.service_id == service_id)
@@ -97,7 +152,7 @@ async def get_service_logs(service_id: str, severity: str | None = None, text: s
     if text: query = query.where(LogRecord.message.ilike(f"%{text}%"))
     rows = list((await session.scalars(query.order_by(desc(LogRecord.timestamp)).limit(limit))).all())
     return [{"id": r.id, "severity": r.severity, "message": r.message, "attributes": r.attributes,
-             "timestamp": r.timestamp.isoformat()} for r in rows]
+             "timestamp": r.timestamp.isoformat(), "source": "simulator"} for r in rows]
 
 @router.get("/incidents", response_model=list[IncidentOut])
 async def list_incidents(session: AsyncSession = Depends(get_session)):
@@ -201,14 +256,46 @@ async def reject(incident_id: str, request: RejectIn, session: AsyncSession = De
 
 @router.post("/demo/scenarios/db-pool-exhaustion", response_model=ScenarioOut)
 async def demo_db_pool(background: BackgroundTasks, session: AsyncSession = Depends(get_session)):
+    require_simulator_mode()
     await inject_pool_exhaustion(session)
     incident = await detect_incident(session)
     await session.commit()
     if incident: background.add_task(run_investigation, incident.id, selected_provider)
     return {"status": "failure_injected", "incident_id": incident.id if incident else None}
 
+async def trigger_monitored_pool_exhaustion() -> None:
+    """Issue bounded concurrent requests to the app's local-only real DB hold endpoint."""
+    url = f"{settings.monitored_app_url.rstrip('/')}/api/test/hold-db-connection"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            responses = await asyncio.gather(
+                *(client.get(url, params={"seconds": 10}) for _ in range(4)),
+                return_exceptions=True,
+            )
+        outcomes = [
+            response.status_code if isinstance(response, httpx.Response) else type(response).__name__
+            for response in responses
+        ]
+        logger.info("Monitored-app pool exhaustion requests completed", extra={
+            "service_id": settings.monitored_service_id,
+            "response_outcomes": outcomes,
+        })
+    except Exception:
+        logger.exception("Could not trigger monitored-app pool exhaustion")
+
+
+@router.post("/monitored/scenarios/db-pool-exhaustion")
+async def monitored_db_pool_exhaustion(background: BackgroundTasks):
+    if settings.telemetry_provider != "prometheus_loki":
+        raise HTTPException(409, "Select prometheus_loki telemetry mode to trigger the monitored application")
+    background.add_task(trigger_monitored_pool_exhaustion)
+    return {"status": "failure_injection_started", "service_id": settings.monitored_service_id,
+            "source": "monitored_application", "concurrent_requests": 4, "hold_seconds": 10}
+
+
 @router.post("/demo/scenarios/worker-failure", response_model=ScenarioOut)
 async def demo_worker_failure(background: BackgroundTasks, session: AsyncSession = Depends(get_session)):
+    require_simulator_mode()
     await inject_worker_failure(session)
     incident = await detect_incident(session)
     await session.commit()
@@ -217,12 +304,14 @@ async def demo_worker_failure(background: BackgroundTasks, session: AsyncSession
 
 @router.post("/demo/reset")
 async def demo_reset(session: AsyncSession = Depends(get_session)):
+    require_simulator_mode()
     await reset_simulator(session)
     await session.commit()
     return {"status": "simulator_reset"}
 
 @router.post("/demo/workload")
 async def trigger_workload(request: WorkloadRequest, background: BackgroundTasks, session: AsyncSession = Depends(get_session)):
+    require_simulator_mode()
     metrics = await generate_workload(session, request.count)
     incident = await detect_incident(session)
     if incident and incident.status == "active": background.add_task(run_investigation, incident.id, selected_provider)

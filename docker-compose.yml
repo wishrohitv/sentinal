@@ -27,7 +27,13 @@ services:
       NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
       NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.tokenfactory.nebius.com/v1}
       NVIDIA_MODEL_NAME: ${NVIDIA_MODEL_NAME:-}
-
+      TELEMETRY_PROVIDER: ${TELEMETRY_PROVIDER:-simulator}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      LOKI_URL: ${LOKI_URL:-http://loki:3100}
+      MONITORED_SERVICE_ID: ${MONITORED_SERVICE_ID:-monitored-api}
+      MONITORED_APP_URL: ${MONITORED_APP_URL:-http://monitored-app:8000}
+      MONITORED_CONTROL_TOKEN: ${MONITORED_CONTROL_TOKEN:-local-only-sentinel-control-token}
+      MONITORED_POOL_MAX_SIZE: ${MAX_DB_POOL_SIZE:-5}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
@@ -51,5 +57,85 @@ services:
       backend:
         condition: service_healthy
 
+  monitored-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: monitored
+      POSTGRES_USER: monitored
+      POSTGRES_PASSWORD: ${MONITORED_DB_PASSWORD:-monitored-local-password}
+    volumes:
+      - monitored_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitored -d monitored"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  monitored-app:
+    build: ./monitored-app
+    environment:
+      APP_ENVIRONMENT: local
+      MONITORED_SERVICE_ID: ${MONITORED_SERVICE_ID:-monitored-api}
+      DATABASE_URL: postgresql+psycopg2://monitored:${MONITORED_DB_PASSWORD:-monitored-local-password}@monitored-db:5432/monitored
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-2}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-0}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-2}
+      MAX_DB_POOL_SIZE: ${MAX_DB_POOL_SIZE:-5}
+      CONTROL_TOKEN: ${MONITORED_CONTROL_TOKEN:-local-only-sentinel-control-token}
+      TEST_ENDPOINTS_ENABLED: ${TEST_ENDPOINTS_ENABLED:-true}
+      LOG_PATH: /var/log/monitored-app/app.jsonl
+    volumes:
+      - monitored_app_logs:/var/log/monitored-app
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      monitored-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=3d"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      monitored-app:
+        condition: service_healthy
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.5.1
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - monitored_app_logs:/var/log/monitored-app:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      monitored-app:
+        condition: service_healthy
+      loki:
+        condition: service_started
+
 volumes:
   postgres_data:
+  monitored_postgres_data:
+  monitored_app_logs:
+  prometheus_data:
+  loki_data:
+  alloy_data:

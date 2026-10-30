@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -7,6 +9,20 @@ class Settings(BaseSettings):
     nebius_base_url: str = "https://api.tokenfactory.nebius.com/v1"
     nvidia_model_name: str = ""
     ai_provider: str = "demo"
+    telemetry_provider: Literal["simulator", "prometheus_loki"] = "simulator"
+    prometheus_url: str = "http://prometheus:9090"
+    loki_url: str = "http://loki:3100"
+    monitored_service_id: str = "monitored-api"
+    monitored_app_url: str = "http://monitored-app:8000"
+    monitored_control_token: str = ""
+    monitored_pool_max_size: int = 5
+    http_error_rate_threshold: float = 0.20
+    db_timeout_rate_threshold: float = 0.10
+    sentinel_detection_interval_seconds: int = 5
+    verification_window_seconds: int = 30
+    verification_poll_interval_seconds: int = 5
+    telemetry_request_timeout_seconds: float = 5.0
+    max_metric_samples: int = 500
     sentinel_max_tool_calls: int = 8
     sentinel_investigation_timeout: int = 90
     sentinel_5xx_threshold: float = 0.10
@@ -22,7 +38,7 @@ class Settings(BaseSettings):
 
     @property
     def effective_provider(self) -> str:
-        if self.ai_provider.lower() == "nemotron" and self.nemotron_available:
+        if self.ai_provider.lower() in {"nemotron", "nebius"} and self.nemotron_available:
             return "nemotron"
         return "demo"
 

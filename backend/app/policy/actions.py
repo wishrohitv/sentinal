@@ -5,7 +5,7 @@ class ActionParameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 class IncreasePoolParameters(ActionParameters):
-    new_limit: int = Field(ge=12, le=64)
+    new_limit: int = Field(ge=3, le=64)
 class EmptyParameters(ActionParameters):
     pass
 class RetryJobsParameters(ActionParameters):

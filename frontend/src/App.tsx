@@ -8,6 +8,7 @@ type Incident = { id: string; title: string; severity: string; status: string; t
 type Event = { id: number; incident_id: string; event_type: string; payload: Record<string, any>; timestamp: string };
 type Proposal = { id: string; action: string; parameters: Record<string, any>; risk: string; status: string; rationale: string; expected_outcome: string; execution?: { status: string; result: any; pre_metrics: any; post_metrics: any } | null };
 type Provider = { active: string; demo_available: boolean; nemotron_available: boolean; model?: string | null };
+type TelemetryStatus = { provider: string; service_id: string; service_name: string; prometheus: { available: boolean | null }; loki: { available: boolean | null }; service: { available: boolean; ready: boolean; source: string }; ai_provider: string };
 const API = '/api';
 const activeStatuses = new Set(['active', 'investigating', 'investigated', 'awaiting_approval', 'remediating']);
 
@@ -19,21 +20,27 @@ function time(value?: string) { return value ? format(new Date(value), 'MMM d, H
 
 export default function App() {
   const [incidents, setIncidents] = useState<Incident[]>([]);
-  const [metrics, setMetrics] = useState<Record<string, number> | null>(null);
+  const [metrics, setMetrics] = useState<Record<string, number | null> | null>(null);
   const [provider, setProvider] = useState<Provider | null>(null);
+  const [telemetry, setTelemetry] = useState<TelemetryStatus | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [connection, setConnection] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
 
   const refresh = useCallback(async () => {
     try {
-      const [ir, mr, pr] = await Promise.all([axios.get(`${API}/incidents`), axios.get(`${API}/services/demo-api/metrics`), axios.get(`${API}/system/provider`)]);
+      const tr = await axios.get(`${API}/system/telemetry`);
+      setTelemetry(tr.data);
+      const [ir, mr, pr] = await Promise.all([axios.get(`${API}/incidents`), axios.get(`${API}/services/${tr.data.service_id}/metrics`), axios.get(`${API}/system/provider`)]);
       setIncidents(ir.data);
       setMetrics(mr.data.current);
       setProvider(pr.data);
+      setTelemetry(tr.data);
       setError('');
     } catch (err) {
+      setMetrics(null);
       setError(axios.isAxiosError(err) ? err.response?.data?.detail || 'Backend unavailable. Check the API connection.' : 'Unable to load Sentinel data.');
     }
   }, []);
@@ -58,21 +65,33 @@ export default function App() {
     catch (err) { setError(axios.isAxiosError(err) ? err.response?.data?.detail || 'Simulator reset failed.' : 'Simulator reset failed.'); }
     finally { setBusy(false); }
   }
+  async function triggerMonitoredPoolExhaustion() {
+    setBusy(true);
+    try {
+      await axios.post(`${API}/monitored/scenarios/db-pool-exhaustion`);
+      setNotice('Real pool exhaustion requests started. Sentinel will detect the incident from Prometheus and Loki telemetry.');
+      window.setTimeout(() => setNotice(''), 6000);
+    } catch (err) {
+      setError(axios.isAxiosError(err) ? err.response?.data?.detail || 'Could not trigger the monitored-app scenario.' : 'Could not trigger the monitored-app scenario.');
+    } finally { setBusy(false); }
+  }
 
   const selectedIncident = incidents.find(i => i.id === selected);
   return <div className="app-shell">
-    <nav className="topbar"><div className="brand"><span className="brand-mark">S</span><span>SENTINEL</span><span className="tag">RELIABILITY OPS</span></div><div className="nav-state"><span className="live-dot" /> Demo environment</div></nav>
+    <nav className="topbar"><div className="brand"><span className="brand-mark">S</span><span>SENTINEL</span><span className="tag">RELIABILITY OPS</span></div><div className="nav-state"><span className="live-dot" /> {telemetry?.provider === 'prometheus_loki' ? 'Prometheus + Loki monitoring' : 'Simulator environment'}</div></nav>
     <main className="content">
       {error && <div className="error-banner"><AlertTriangle size={17}/>{error}<button onClick={() => setError('')} aria-label="Dismiss error">×</button></div>}
+      {notice && <div className="notice-banner"><CheckCircle2 size={17}/>{notice}<button onClick={() => setNotice('')} aria-label="Dismiss notice">×</button></div>}
       {selected && selectedIncident ? <IncidentPage incident={selectedIncident} back={() => setSelected(null)} onChanged={refresh} connection={connection} setConnection={setConnection} /> : <>
-        <div className="page-heading"><div><div className="eyebrow">OPERATIONS / OVERVIEW</div><h1>Service overview</h1><p>Production simulator telemetry and incident response.</p></div><div className="provider-control"><label htmlFor="provider">Agent provider</label><select id="provider" value={provider?.active || 'demo'} disabled={busy || !provider} onChange={e => void changeProvider(e.target.value)}><option value="demo">Deterministic demo agent</option><option value="nemotron" disabled={!provider?.nemotron_available}>OpenAI-compatible model{provider?.nemotron_available ? ` (${provider.model})` : ' · configure credentials'}</option></select></div></div>
+        <div className="page-heading"><div><div className="eyebrow">OPERATIONS / OVERVIEW</div><h1>Service overview</h1><p>{telemetry?.provider === 'prometheus_loki' ? 'Real monitored-app telemetry and incident response.' : 'Production simulator telemetry and incident response.'}</p></div><div className="provider-control"><label htmlFor="provider">Agent provider</label><select id="provider" value={provider?.active || 'demo'} disabled={busy || !provider} onChange={e => void changeProvider(e.target.value)}><option value="demo">Deterministic demo agent</option><option value="nemotron" disabled={!provider?.nemotron_available}>OpenAI-compatible model{provider?.nemotron_available ? ` (${provider.model})` : ' · configure credentials'}</option></select></div></div>
+        <section className="panel" style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:16,flexWrap:'wrap'}}><div><div className="eyebrow">MONITORING ENVIRONMENT</div><strong>{telemetry?.service_name || 'Loading service…'}</strong><div className="muted">Telemetry source: {telemetry?.provider === 'prometheus_loki' ? 'Prometheus + Loki' : 'Sentinel simulator'} · AI: {telemetry?.ai_provider || provider?.active || 'loading'}</div></div>{telemetry?.provider === 'prometheus_loki' && <div style={{display:'flex',gap:8,flexWrap:'wrap'}}><StatusBadge name="Application" active={telemetry.service.ready}/><StatusBadge name="Prometheus" active={telemetry.prometheus.available === true}/><StatusBadge name="Loki" active={telemetry.loki.available === true}/></div>}</section>
         <div className="metric-grid">
-          <Metric title="HTTP 5xx rate" value={metrics ? `${(metrics.http_5xx_rate * 100).toFixed(1)}%` : '—'} icon={<Activity/>} danger={!!metrics && metrics.http_5xx_rate > 0.1}/>
-          <Metric title="DB pool utilization" value={metrics ? `${(metrics.db_pool_utilization * 100).toFixed(1)}%` : '—'} icon={<Database/>} danger={!!metrics && metrics.db_pool_utilization > 0.9}/>
-          <Metric title="Request latency" value={metrics ? `${metrics.request_latency_ms.toFixed(0)} ms` : '—'} icon={<Clock3/>}/>
-          <Metric title="Worker health" value={metrics?.worker_healthy ? 'ONLINE' : metrics ? 'OFFLINE' : '—'} icon={<Radio/>} danger={!!metrics && !metrics.worker_healthy}/>
+          <Metric title="HTTP 5xx rate" value={typeof metrics?.http_5xx_rate === 'number' ? `${(metrics.http_5xx_rate * 100).toFixed(1)}%` : '—'} icon={<Activity/>} danger={typeof metrics?.http_5xx_rate === 'number' && metrics.http_5xx_rate > 0.1}/>
+          <Metric title="DB pool utilization" value={typeof metrics?.db_pool_utilization === 'number' ? `${(metrics.db_pool_utilization * 100).toFixed(1)}%` : '—'} icon={<Database/>} danger={typeof metrics?.db_pool_utilization === 'number' && metrics.db_pool_utilization > 0.9}/>
+          <Metric title="Request latency" value={typeof metrics?.request_latency_ms === 'number' ? `${metrics.request_latency_ms.toFixed(0)} ms` : '—'} icon={<Clock3/>}/>
+          <Metric title="Worker health" value={telemetry?.provider === 'prometheus_loki' ? 'N/A' : metrics?.worker_healthy ? 'ONLINE' : metrics ? 'OFFLINE' : '—'} icon={<Radio/>} danger={telemetry?.provider !== 'prometheus_loki' && !!metrics && !metrics.worker_healthy}/>
         </div>
-        <section className="panel demo-controls"><div><div className="eyebrow">DEMO CONTROLS</div><h2>Inject a controlled failure</h2><p>The simulator generates the logs and metrics Sentinel investigates.</p></div><div className="button-row"><button className="button secondary" disabled={busy} onClick={() => void reset()}><RefreshCw size={16}/>Reset simulator</button><button className="button danger" disabled={busy || incidents.some(i => activeStatuses.has(i.status))} onClick={() => void trigger('db-pool-exhaustion')}><Database size={16}/>DB pool exhaustion</button><button className="button amber" disabled={busy || incidents.some(i => activeStatuses.has(i.status))} onClick={() => void trigger('worker-failure')}><AlertTriangle size={16}/>Worker failure</button></div></section>
+        {telemetry?.provider === 'prometheus_loki' ? <section className="panel demo-controls"><div><div className="eyebrow">LOCAL MONITORED-APP SCENARIO</div><h2>Inject real pool exhaustion</h2><p>Sends concurrent requests that hold actual SQLAlchemy connections; Prometheus and Loki provide the resulting evidence.</p></div><div className="button-row"><button className="button danger" disabled={busy || incidents.some(i => activeStatuses.has(i.status)) || telemetry.service.ready === false} onClick={() => void triggerMonitoredPoolExhaustion()}><Database size={16}/>{busy ? 'Starting…' : 'Exhaust monitored DB pool'}</button></div></section> : <section className="panel demo-controls"><div><div className="eyebrow">DEMO CONTROLS</div><h2>Inject a controlled failure</h2><p>The simulator generates the logs and metrics Sentinel investigates.</p></div><div className="button-row"><button className="button secondary" disabled={busy} onClick={() => void reset()}><RefreshCw size={16}/>Reset simulator</button><button className="button danger" disabled={busy || incidents.some(i => activeStatuses.has(i.status))} onClick={() => void trigger('db-pool-exhaustion')}><Database size={16}/>DB pool exhaustion</button><button className="button amber" disabled={busy || incidents.some(i => activeStatuses.has(i.status))} onClick={() => void trigger('worker-failure')}><AlertTriangle size={16}/>Worker failure</button></div></section>}
         <section className="panel incidents-panel"><div className="section-heading"><div><div className="eyebrow">INCIDENTS</div><h2>Incident history</h2></div><button className="icon-button" onClick={() => void refresh()} title="Refresh"><RefreshCw size={16}/></button></div>
           {incidents.length === 0 ? <div className="empty-state"><CheckCircle2/><strong>No incidents recorded</strong><span>Trigger a demo scenario to start an investigation.</span></div> : <div className="incident-list">{incidents.map(item => <button key={item.id} className="incident-row" onClick={() => setSelected(item.id)}><span className="severity-mark"/><span className="incident-copy"><strong>{item.title}</strong><small>{item.trigger}</small></span><Badge value={item.status}/><time>{time(item.created_at)}</time><span className="row-arrow">→</span></button>)}</div>}
         </section>
@@ -80,6 +99,9 @@ export default function App() {
       </>}
     </main>
   </div>;
+}
+function StatusBadge({ name, active }: { name: string; active: boolean }) {
+  return <span className={`badge ${active ? 'good' : 'bad'}`}>{name}: {active ? 'connected' : 'unavailable'}</span>;
 }
 function Metric({ title, value, icon, danger = false }: { title: string; value: string; icon: ReactNode; danger?: boolean }) {
   return <div className={`metric-card ${danger ? 'metric-danger' : ''}`}><div className="metric-top"><span className="metric-icon">{icon}</span><span className={`metric-health ${danger ? 'text-red' : 'text-green'}`}>{danger ? 'DEGRADED' : 'NORMAL'}</span></div><span className="metric-title">{title}</span><strong>{value}</strong></div>;

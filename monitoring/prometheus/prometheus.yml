@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: monitored-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["monitored-app:8000"]
+        labels:
+          service: monitored-api

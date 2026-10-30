@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Any
 from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +10,8 @@ from app.models import Incident, RemediationProposal, RemediationExecution, Appr
 from app.policy.actions import ACTION_REGISTRY, evaluate_policy, validate_action
 from app.simulator.state import recover_pool, restart_worker_action, current_metrics
 from app.services.timeline import add_event
+from app.telemetry.monitored_app import MonitoredAppAdapter
+from app.telemetry.prometheus import PrometheusAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +26,18 @@ async def propose_remediation(session: AsyncSession, incident_id: str, hypothesi
         await session.commit()
         return None
     params = validate_action(action, hypothesis.get("parameters", {}))
+    if settings.telemetry_provider == "prometheus_loki" and action == "increase_db_pool":
+        if params["new_limit"] > settings.monitored_pool_max_size:
+            raise ValueError(f"Monitored pool remediation cannot exceed {settings.monitored_pool_max_size}")
     policy = evaluate_policy(action, len(set(hypothesis.get("supporting_evidence", []))),
                              hypothesis.get("confidence", 0), incident.status in {"active", "investigated", "investigating"})
+    if settings.telemetry_provider == "prometheus_loki" and action != "increase_db_pool":
+        policy = {"decision": "blocked", "reason": "Action is not registered for the monitored application environment"}
     risk = ACTION_REGISTRY[action]["risk"]
     status = {"approval_required": "pending_approval", "auto_allowed": "approved", "blocked": "blocked"}[policy["decision"]]
     proposal = RemediationProposal(id=str(uuid4()), incident_id=incident_id, action=action,
         parameters=params, risk=risk, status=status, rationale=hypothesis.get("explanation", "Agent proposal"),
-        expected_outcome=hypothesis.get("expected_outcome") or "Verify health using fresh simulator metrics.")
+        expected_outcome=hypothesis.get("expected_outcome") or "Verify health using fresh telemetry.")
     session.add(proposal)
     await session.flush()
     await add_event(session, incident_id, "REMEDIATION_PROPOSED", {"proposal_id": proposal.id,
@@ -44,6 +52,12 @@ async def propose_remediation(session: AsyncSession, incident_id: str, hypothesi
         await execute_remediation(session, proposal.id)
     await session.commit()
     return proposal
+
+async def collect_current_metrics(session: AsyncSession) -> dict:
+    if settings.telemetry_provider == "prometheus_loki":
+        return await PrometheusAdapter().current_metrics()
+    return await current_metrics(session)
+
 
 async def execute_remediation(session: AsyncSession, proposal_id: str) -> RemediationExecution:
     # Row lock plus a unique execution.proposal_id protects concurrent approval requests on PostgreSQL.
@@ -60,37 +74,59 @@ async def execute_remediation(session: AsyncSession, proposal_id: str) -> Remedi
     validated = validate_action(proposal.action, proposal.parameters)
     if validated != proposal.parameters:
         raise ValueError("Stored proposal parameters no longer match the action schema")
-    pre = await current_metrics(session)
+    pre = await collect_current_metrics(session)
     execution = RemediationExecution(proposal_id=proposal.id, status="running", pre_metrics=pre)
     session.add(execution)
     incident.status = "remediating"
     await session.flush()
     try:
-        from app.simulator.state import generate_workload
-        if proposal.action == "increase_db_pool":
-            await recover_pool(session, proposal.parameters["new_limit"])
-            result = {"status": "simulator_pool_limit_changed", "new_limit": proposal.parameters["new_limit"]}
-            sample_count = 100
-        elif proposal.action == "restart_worker":
-            await restart_worker_action(session)
-            result = {"status": "simulator_worker_restarted"}
-            sample_count = 20
-        elif proposal.action == "retry_failed_jobs":
-            from app.simulator.state import retry_failed_jobs_action
-            result = {"status": "simulator_jobs_retried", **await retry_failed_jobs_action(session, proposal.parameters["max_jobs"])}
-            sample_count = 20
+        real_mode = settings.telemetry_provider == "prometheus_loki"
+        fresh: dict[str, Any]
+        if real_mode:
+            if proposal.action != "increase_db_pool":
+                raise ValueError(f"Action {proposal.action} has no monitored-application executor")
+            result = await MonitoredAppAdapter().increase_pool_size(proposal.parameters["new_limit"])
+            sample_count = 0
         else:
-            raise ValueError(f"Action {proposal.action} is registered but has no safe simulator executor")
+            from app.simulator.state import generate_workload
+            if proposal.action == "increase_db_pool":
+                await recover_pool(session, proposal.parameters["new_limit"])
+                result = {"status": "simulator_pool_limit_changed", "new_limit": proposal.parameters["new_limit"]}
+                sample_count = 100
+            elif proposal.action == "restart_worker":
+                await restart_worker_action(session)
+                result = {"status": "simulator_worker_restarted"}
+                sample_count = 20
+            elif proposal.action == "retry_failed_jobs":
+                from app.simulator.state import retry_failed_jobs_action
+                result = {"status": "simulator_jobs_retried", **await retry_failed_jobs_action(session, proposal.parameters["max_jobs"])}
+                sample_count = 20
+            else:
+                raise ValueError(f"Action {proposal.action} is registered but has no safe simulator executor")
         await add_event(session, incident.id, "ACTION_EXECUTED", {"proposal_id": proposal.id,
             "action": proposal.action, "parameters": proposal.parameters, "risk": proposal.risk,
-            "pre_metrics": pre, "result": result})
-        await add_event(session, incident.id, "VERIFICATION_STARTED", {"action": proposal.action})
-        async with asyncio.timeout(settings.sentinel_verification_timeout):
-            await generate_workload(session, sample_count)
-            fresh = await current_metrics(session)
+            "pre_metrics": pre, "result": result, "source": "monitored_application" if real_mode else "simulator"})
+        await add_event(session, incident.id, "VERIFICATION_STARTED", {"action": proposal.action,
+            "source": "prometheus" if real_mode else "simulator"})
+        if real_mode:
+            async with asyncio.timeout(settings.verification_window_seconds):
+                health: dict[str, Any] = {}
+                while True:
+                    fresh = await PrometheusAdapter().current_metrics()
+                    health = await MonitoredAppAdapter().health()
+                    if verify_metrics(proposal.action, fresh, real_mode=True) and health.get("ready"):
+                        break
+                    await asyncio.sleep(settings.verification_poll_interval_seconds)
+            fresh["service_health"] = health
+        else:
+            from app.simulator.state import generate_workload
+            async with asyncio.timeout(settings.sentinel_verification_timeout):
+                await generate_workload(session, sample_count)
+                fresh = await current_metrics(session)
         execution.result = result
         execution.post_metrics = fresh
-        recovered = verify_metrics(proposal.action, fresh)
+        recovered = verify_metrics(proposal.action, fresh, real_mode=real_mode) and (
+            not real_mode or bool(fresh.get("service_health", {}).get("ready")))
         execution.status = "succeeded" if recovered else "verification_failed"
         proposal.status = "executed" if recovered else "failed"
         if recovered:
@@ -107,7 +143,7 @@ async def execute_remediation(session: AsyncSession, proposal_id: str) -> Remedi
     except Exception as exc:
         logger.exception("Remediation action failed")
         execution.status = "failed"
-        execution.result = {"error": "Registered simulator action failed", "error_type": type(exc).__name__}
+        execution.result = {"error": "Registered remediation action failed", "error_type": type(exc).__name__}
         proposal.status = "failed"
         incident.status = "escalated"
         incident.outcome = "unsuccessful_remediation"
@@ -116,11 +152,16 @@ async def execute_remediation(session: AsyncSession, proposal_id: str) -> Remedi
     await session.flush()
     return execution
 
-def verify_metrics(action: str, metrics: dict[str, float]) -> bool:
+def verify_metrics(action: str, metrics: dict[str, Any], real_mode: bool = False) -> bool:
     if action == "increase_db_pool":
-        return (metrics.get("http_5xx_rate", 1) < 0.10 and
-                metrics.get("db_pool_utilization", 1) < 0.90 and
-                metrics.get("db_connection_timeout_rate", 1) == 0)
+        error_threshold = settings.http_error_rate_threshold if real_mode else 0.10
+        pool_threshold = settings.sentinel_db_pool_threshold
+        timeout_threshold = settings.db_timeout_rate_threshold if real_mode else 0.0
+        latency = metrics.get("request_latency_ms")
+        return (isinstance(metrics.get("http_5xx_rate"), (int, float)) and metrics["http_5xx_rate"] < error_threshold and
+                isinstance(metrics.get("db_pool_utilization"), (int, float)) and metrics["db_pool_utilization"] < pool_threshold and
+                isinstance(metrics.get("db_connection_timeout_rate"), (int, float)) and metrics["db_connection_timeout_rate"] <= timeout_threshold and
+                (not real_mode or (isinstance(latency, (int, float)) and latency < 500)))
     if action == "restart_worker":
         return metrics.get("worker_healthy", 0) == 1.0
     if action == "retry_failed_jobs":

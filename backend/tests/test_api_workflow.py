@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import app.database as database
 import app.api.router as router
 import app.main as main
+from app.config import settings
 from app.simulator.state import state
 
 @pytest.fixture
@@ -15,6 +16,7 @@ def test_client(monkeypatch):
     monkeypatch.setattr(main, "engine", engine)
     monkeypatch.setattr(main, "SessionLocal", factory)
     monkeypatch.setattr(router, "SessionLocal", factory)
+    monkeypatch.setattr(router, "selected_provider", "demo")
     state.failed = False
     state.pool_limit = 10
     state.worker_healthy = True
@@ -25,6 +27,18 @@ def test_client(monkeypatch):
         yield client
     import asyncio
     asyncio.run(engine.dispose())
+
+@pytest.mark.asyncio
+async def test_real_pool_scenario_endpoint_schedules_controlled_requests(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    monkeypatch.setattr(settings, "telemetry_provider", "prometheus_loki")
+    background = BackgroundTasks()
+    result = await router.monitored_db_pool_exhaustion(background)
+    assert result["source"] == "monitored_application"
+    assert result["concurrent_requests"] == 4
+    assert len(background.tasks) == 1
+
 
 def test_failure_injection_sse_approval_and_verified_resolution(test_client):
     client = test_client
