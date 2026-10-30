@@ -9,7 +9,7 @@ type Event = { id: number; incident_id: string; event_type: string; payload: Rec
 type Proposal = { id: string; action: string; parameters: Record<string, any>; risk: string; status: string; rationale: string; expected_outcome: string; execution?: { status: string; result: any; pre_metrics: any; post_metrics: any } | null };
 type Provider = { active: string; demo_available: boolean; nemotron_available: boolean; model?: string | null };
 type TelemetryStatus = { provider: string; service_id: string; service_name: string; prometheus: { available: boolean | null }; loki: { available: boolean | null }; service: { available: boolean; ready: boolean; source: string }; ai_provider: string };
-const API = '/api';
+const API = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/+$/, '');
 const activeStatuses = new Set(['active', 'investigating', 'investigated', 'awaiting_approval', 'remediating']);
 
 function Badge({ value }: { value: string }) {

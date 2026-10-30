@@ -224,3 +224,23 @@ docker compose up -d --force-recreate backend
 - **Remediation/verification failure:** inspect the incident execution result and backend/monitored-app logs. The app control token must match on both services, requested size cannot exceed `MAX_DB_POOL_SIZE`, and verification requires fresh Prometheus data and ready service state.
 
 See [`architecture.md`](architecture.md) for data flow, trust boundaries, policy, and implemented limitations. Real-mode worker remediation and orchestrator-based deployment discovery are not implemented; the existing worker scenario remains simulator-only.
+
+## Build and deploy the frontend static artifact
+
+The frontend reads `VITE_API_BASE_URL` at build time. It should be the public backend base URL **including `/api`**, for example `https://api.example.com/api`. Copy `frontend/.env.production.example` to `frontend/.env.production` and replace the example URL with your deployed backend URL. Then build:
+
+```sh
+cd frontend
+cp .env.production.example .env.production
+# Edit .env.production and set VITE_API_BASE_URL=https://your-backend.example/api
+npm ci
+npm run build
+```
+
+The static deployment output is `frontend/dist`. To package it from the repository root:
+
+```sh
+tar -czf frontend-dist.tar.gz -C frontend dist
+```
+
+`VITE_API_BASE_URL` is embedded in the JavaScript bundle; changing it requires a rebuild. If it is unset, the frontend defaults to `/api`, so configure the static web server to reverse-proxy `/api` to Sentinel’s backend. For cross-origin deployment, also set backend `CORS_ORIGINS` to the frontend’s public origin. `VITE_API_TARGET` configures only Vite’s development proxy and does not set the production bundle’s API URL.
