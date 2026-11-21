@@ -13,6 +13,7 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
         }
       }
-    }
+    },
+    allowedHosts: ['sentinal.fly.dev']
   }
 })
